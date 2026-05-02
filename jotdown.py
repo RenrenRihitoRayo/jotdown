@@ -1,633 +1,632 @@
 #!/usr/bin/env python3
-"""
-Jotdown v0.1 Parser
-Converts Jotdown markup to HTML with single-pass left-to-right streaming.
-"""
-
-import re
-from enum import Enum
-from typing import List, Dict, Optional, Tuple, Any
+from __future__ import annotations
 from dataclasses import dataclass, field
-import webbrowser
+from typing import List, Optional
+import html as _html
+import re
 
 
 @dataclass
-class Header:
+class THeader:
     level: int
     text: str
-    id: Optional[str] = None
+    anchor: Optional[str] = None
+
+@dataclass
+class TOlItem:
+    number: int
+    text: str
+
+@dataclass
+class TUlItem:
+    text: str
+
+@dataclass
+class TUlItemAny:
+    text: str
+
+@dataclass
+class TBlockOpen:
+    kind: str  # "separator" | "style" | "html"
+
+@dataclass
+class TBlockClose:
+    pass
+
+@dataclass
+class TParaLine:
+    text: str
+
+@dataclass
+class TParaBreak:
+    pass
+
+@dataclass
+class TRawContent:
+    raw: str
+    kind: str  # "style" | "html"
 
 
 @dataclass
-class Link:
-    text: str
+class IText:
+    content: str
+
+@dataclass
+class IInlineCode:
+    content: str
+    language: str = ""
+
+@dataclass
+class ILink:
+    text_tokens: list
     url: str
-    is_image: bool = False
 
+@dataclass
+class IImage:
+    src: str
+    url: str
+    default: str = "image"
 
-class JotdownParser:
-    """Parses Jotdown markup into HTML."""
+@dataclass
+class IFormatOpen:
+    bold: bool = False
+    em_italic: bool = False
+    underline: bool = False
+    strikethrough: bool = False
+    subscript: bool = False
+    superscript: bool = False
+    subsup: bool = False
+    sym: bool = False
+    idio_italic: bool = False
 
+@dataclass
+class IFormatClose:
+    pass
+
+@dataclass
+class ISymbol:
+    content: str  # safe HTML already, e.g. "&nbsp;" or "<br>"
+
+@dataclass
+class THrLine:
+    pass
+    
+
+class _InlineLexer:
     def __init__(self, text: str):
-        self.text = text
-        self.pos = 0
-        self.length = len(text)
+        self._s = text
+        self._pos = 0
 
-    def parse(self, setup=True) -> str:
-        """Parse entire document and return HTML."""
-        blocks = self._parse_blocks()
-        return ("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"if setup else"")+self._render_blocks_to_html(blocks)
-
-    def _at_line_start(self) -> bool:
-        """Check if current position is at line start."""
-        return self.pos == 0 or (self.pos > 0 and self.text[self.pos - 1] == '\n')
-
-    def _peek(self, offset: int = 0) -> Optional[str]:
-        """Peek at character without consuming."""
-        idx = self.pos + offset
-        return self.text[idx] if idx < self.length else None
-
-    def _consume(self) -> Optional[str]:
-        """Consume and return next character."""
-        if self.pos < self.length:
-            char = self.text[self.pos]
-            self.pos += 1
-            return char
-        return None
-
-    def _skip_whitespace_lines(self):
-        """Skip blank lines."""
-        while self.pos < self.length:
-            if self.text[self.pos] == '\n':
-                self.pos += 1
-            elif self.text[self.pos].isspace():
-                self.pos += 1
+    def lex(self) -> list:
+        tokens = []
+        while self._pos < len(self._s):
+            ch = self._ch()
+            if ch == '\\':
+                self._pos += 1
+                tokens.append(IText(content=self._ch() or ''))
+                self._pos += 1
+            elif ch == '`':
+                tokens.append(self._lex_code())
+            elif ch == '[':
+                tokens.append(self._lex_link())
+            elif ch == '(' and self._pos + 1 < len(self._s) and self._s[self._pos + 1] in '*_-^%.':
+                tokens.extend(self._lex_format())
             else:
-                break
+                tokens.append(self._lex_text())
+        return tokens
 
-    def _consume_line(self) -> str:
-        """Consume until end of line (newline not included, but consumed)."""
-        result = ""
-        while self.pos < self.length and self.text[self.pos] != '\n':
-            result += self.text[self.pos]
-            self.pos += 1
-        if self.pos < self.length and self.text[self.pos] == '\n':
-            self.pos += 1
-        return result
+    def _lex_code(self):
+        self._pos += 1  # opening `
+        language = ''
+        if self._ch() == '<':
+            self._pos += 1
+            while self._pos < len(self._s) and self._s[self._pos] != '>':
+                language += self._s[self._pos]
+                self._pos += 1
+            if self._ch() == '>': self._pos += 1
+            if self._ch() == ' ': self._pos += 1
+        code = ''
+        while self._pos < len(self._s) and self._s[self._pos] != '`':
+            code += self._s[self._pos]
+            self._pos += 1
+        if self._ch() == '`': self._pos += 1
+        return IInlineCode(content=code, language=language)
 
-    def _parse_blocks(self) -> List[Dict[str, Any]]:
-        """Parse document into blocks."""
-        blocks = []
-
-        while self.pos < self.length:
-            self._skip_whitespace_lines()
-            if self.pos >= self.length:
-                break
-
-            # Must be at line start for block constructs
-            if not self._at_line_start():
-                # This shouldn't happen if skipping works correctly
-                self.pos += 1
-                continue
-
-            # Try header
-            if self._peek() == '#':
-                blocks.append(self._parse_header())
-                continue
-
-            # Try ordered list
-            if re.match(r'^\d+\.', self.text[self.pos:]):
-                blocks.append(self._parse_ordered_list())
-                continue
-
-            # Try unordered list
-            if self.text[self.pos:self.pos + 2] == '..':
-                blocks.append(self._parse_unordered_list())
-                continue
-
-            # Try block wrappers
-            if self._peek() == '!' and self._peek(1) in ['[', 's', 'h']:
-                if self.text[self.pos:self.pos + 2] == '![':
-                    blocks.append(self._parse_separator_block())
-                    continue
-                elif self.text[self.pos:self.pos + 7] == '!style[':
-                    blocks.append(self._parse_style_block())
-                    continue
-                elif self.text[self.pos:self.pos + 6] == '!html[':
-                    blocks.append(self._parse_html_block())
-                    continue
-
-            # Otherwise parse as paragraph
-            blocks.append(self._parse_paragraph())
-
-        return blocks
-
-    def _parse_header(self) -> Dict[str, Any]:
-        """Parse header at line start."""
-        level = 0
-        while self.pos < self.length and self.text[self.pos] == '#':
-            level += 1
-            self.pos += 1
-
-        # Skip spaces
-        while self.pos < self.length and self.text[self.pos] == ' ':
-            self.pos += 1
-
-        # Check for explicit ID
-        header_id = None
-        if self._peek() == '<':
-            self.pos += 1
-            header_id = ""
-            while self.pos < self.length and self.text[self.pos] != '>':
-                header_id += self.text[self.pos]
-                self.pos += 1
-            if self._peek() == '>':
-                self.pos += 1
-            # Skip space after ID
-            if self._peek() == ' ':
-                self.pos += 1
-
-        text_content = self._consume_line()
-
-        return {
-            'type': 'header',
-            'level': level,
-            'text': text_content.strip(),
-            'id': header_id
-        }
-
-    def _parse_ordered_list(self) -> Dict[str, Any]:
-        """Parse numeric ordered list."""
-        items = []
-
-        while self.pos < self.length and self._at_line_start():
-            match = re.match(r'^(\d+)\.\s*', self.text[self.pos:])
-            if not match:
-                break
-
-            number = int(match.group(1))
-            self.pos += len(match.group(0))
-            text = self._consume_line()
-            items.append((number, text))
-
-        return {
-            'type': 'ordered_list',
-            'items': items
-        }
-
-    def _parse_alphabetic_list(self) -> Dict[str, Any]:
-        """Parse alphabetic ordered list."""
-        items = []
-
-        while self.pos < self.length and self._at_line_start():
-            match = re.match(r'^([a-z])\.\s*', self.text[self.pos:])
-            if not match:
-                break
-
-            letter = match.group(1)
-            self.pos += len(match.group(0))
-            text = self._consume_line()
-            items.append((letter, text))
-
-        return {
-            'type': 'alphabetic_list',
-            'items': items
-        }
-
-    def _parse_unordered_list(self) -> Dict[str, Any]:
-        """Parse unordered list."""
-        items = []
-
-        while self.pos < self.length and self._at_line_start():
-            if self.text[self.pos:self.pos + 2] != '..':
-                break
-
-            self.pos += 2
-            if self._peek() == ' ':
-                self.pos += 1
-
-            text = self._consume_line()
-            items.append(text)
-
-        return {
-            'type': 'unordered_list',
-            'items': items
-        }
-
-    def _parse_separator_block(self) -> Dict[str, Any]:
-        """Parse separator block ![ ... ]"""
-        self.pos += 2
-        content = ""
-        depth = 1
-
-        while self.pos < self.length and depth > 0:
-            if self.text[self.pos] == '[':
-                depth += 1
-            elif self.text[self.pos] == ']':
-                depth -= 1
-                if depth == 0:
-                    self.pos += 1
-                    break
-            content += self.text[self.pos]
-            self.pos += 1
-
-        return {
-            'type': 'separator_block',
-            'content': content
-        }
-
-    def _parse_style_block(self) -> Dict[str, Any]:
-        """Parse style block !style[ ... ]"""
-        self.pos += 7
-        content = ""
-        depth = 1
-
-        while self.pos < self.length and depth > 0:
-            if self.text[self.pos] == '[':
-                depth += 1
-            elif self.text[self.pos] == ']':
-                depth -= 1
-                if depth == 0:
-                    self.pos += 1
-                    break
-            content += self.text[self.pos]
-            self.pos += 1
-
-        return {
-            'type': 'style_block',
-            'content': content
-        }
-
-    def _parse_html_block(self) -> Dict[str, Any]:
-        """Parse HTML block !html[ ... ]"""
-        self.pos += 6
-        content = ""
-        depth = 1
-
-        while self.pos < self.length and depth > 0:
-            if self.text[self.pos] == '[':
-                depth += 1
-            elif self.text[self.pos] == ']':
-                depth -= 1
-                if depth == 0:
-                    self.pos += 1
-                    break
-            content += self.text[self.pos]
-            self.pos += 1
-
-        return {
-            'type': 'html_block',
-            'content': content
-        }
-
-    def _parse_paragraph(self) -> Dict[str, Any]:
-        """Parse paragraph block."""
-        lines = []
-
-        while self.pos < self.length:
-            # Stop at block boundaries
-            if self._at_line_start():
-                if self.text[self.pos] in ['#', '`'] or self.text[self.pos:self.pos + 3] == '```':
-                    break
-
-            line = self._consume_line()
-            if line.strip():
-                lines.append(line)
-            else:
-                # Empty line ends paragraph
-                if lines:
-                    break
-
-        return {
-            'type': 'paragraph',
-            'lines': lines
-        }
-
-    def _parse_inline(self, text: str) -> List[Dict[str, Any]]:
-        """Parse inline elements in text."""
-        result = []
-        pos = 0
-
-        while pos < len(text):
-            # Handle escape
-            if text[pos] == '\\' and pos + 1 < len(text):
-                result.append({
-                    'type': 'text',
-                    'content': text[pos + 1]
-                })
-                pos += 2
-                continue
-
-            # Try inline code
-            if text[pos] == '`':
-                token, new_pos = self._parse_inline_code(text, pos)
-                if token:
-                    result.append(token)
-                    pos = new_pos
-                    continue
-
-            # Try link
-            if text[pos] == '[':
-                token, new_pos = self._parse_link(text, pos)
-                if token:
-                    result.append(token)
-                    pos = new_pos
-                    continue
-
-            # Try formatting: (*...), (**...), (_...), etc.
-            if text[pos] == '(' and pos + 1 < len(text) and text[pos + 1] in '*_-^%':
-                token, new_pos = self._parse_formatting(text, pos)
-                if token:
-                    result.append(token)
-                    pos = new_pos
-                    continue
-
-            # Regular text
-            chunk = ""
-            while pos < len(text) and text[pos] not in '\\`[(':
-                chunk += text[pos]
-                pos += 1
-
-            if chunk:
-                result.append({
-                    'type': 'text',
-                    'content': chunk
-                })
-
-        return result
-
-    def _parse_inline_code(self, text: str, start_pos: int) -> Tuple[Optional[Dict], int]:
-        """Parse `code` or `<lang> code`"""
-        pos = start_pos + 1
-        language = ""
-
-        # Check for language tag
-        if pos < len(text) and text[pos] == '<':
-            pos += 1
-            while pos < len(text) and text[pos] != '>':
-                language += text[pos]
-                pos += 1
-            if pos < len(text):
-                pos += 1  # Skip >
-            if pos < len(text) and text[pos] == ' ':
-                pos += 1
-
-        # Find closing backtick
-        code = ""
-        while pos < len(text) and text[pos] != '`':
-            code += text[pos]
-            pos += 1
-
-        if pos >= len(text):
-            return None, start_pos
-
-        pos += 1  # Consume closing backtick
-
-        return {
-            'type': 'inline_code',
-            'content': code,
-            'language': language
-        }, pos
-
-    def _parse_link(self, text: str, start_pos: int) -> Tuple[Optional[Dict], int]:
-        """Parse [text](url) or [!img source](url)"""
-        pos = start_pos + 1
+    def _lex_link(self):
+        self._pos += 1  # [
         is_image = False
-
-        # Check for image marker
-        if pos < len(text) and text[pos] == '!':
+        if self._ch() == '!':
+            self._pos += 1
             is_image = True
-            pos += 1
-            # [!img source]
-            if pos + 2 < len(text) and text[pos:pos + 3] == 'img':
-                pos += 3
-                if pos < len(text) and text[pos] == ' ':
-                    pos += 1
+            if self._s[self._pos:self._pos+3] == 'img':
+                self._pos += 3
+                if self._ch() == ' ': self._pos += 1
 
-        # Read until ]
-        link_text = ""
-        while pos < len(text) and text[pos] != ']':
-            link_text += text[pos]
-            pos += 1
+        inner = ''
+        while self._pos < len(self._s) and self._s[self._pos] != ']':
+            inner += self._s[self._pos]
+            self._pos += 1
+        if self._ch() == ']': self._pos += 1
 
-        if pos >= len(text):
-            return None, start_pos
+        if self._ch() != '(':
+            return IText(content=('[!img ' if is_image else '[') + inner + ']')
 
-        pos += 1  # Consume ]
+        self._pos += 1  # (
+        url = ''
+        while self._pos < len(self._s) and self._s[self._pos] != ')':
+            url += self._s[self._pos]
+            self._pos += 1
+        if self._ch() == ')': self._pos += 1
 
-        # Must have (url)
-        if pos >= len(text) or text[pos] != '(':
-            return None, start_pos
+        if is_image:
+            default = "image"
+            if "??" in inner:
+                inner, default = inner.split("??", 1)
+            return IImage(src=inner, url=url, default=default)
+        return ILink(text_tokens=_InlineLexer(inner).lex(), url=url)
 
-        pos += 1
-        url = ""
-        while pos < len(text) and text[pos] != ')':
-            url += text[pos]
-            pos += 1
+    def _lex_format(self):
+        self._pos += 1  # (
 
-        if pos >= len(text):
-            return None, start_pos
-
-        pos += 1  # Consume )
-
-        return {
-            'type': 'image_link' if is_image else 'link',
-            'text': link_text,
-            'url': url
-        }, pos
-
-    def _parse_formatting(self, text: str, start_pos: int) -> Tuple[Optional[Dict], int]:
-        """Parse (*text), (**text), (_text), (_*text), etc."""
-        pos = start_pos + 1
-        
-        # Collect markers
         bold = False
-        italic = False
+        em_italic = False
         underline = False
         strikethrough = False
         subscript = False
         superscript = False
         subsup = False
+        sym = False
+        idio_italic = False
 
-        # Parse regular markers
-        while pos < len(text) and text[pos] in '*_-^%':
-            if text[pos] == '*':
-                bold = True
-            elif text[pos] == '_':
-                if not underline:
-                    underline = True
-                elif underline:
-                    underline = False
-                    subscript = True
-                elif subscript:
-                    underline = True
-            elif text[pos] == '%':
-                subsup = True
-            elif text[pos] == '-':
-                strikethrough = True
-            elif text[pos] == '^':
-                superscript = True
-            pos += 1
+        while self._pos < len(self._s) and self._s[self._pos] in '*_-^%.':
+            m = self._s[self._pos]
+            if m == '*':
+                if not bold:        bold = True
+                elif not em_italic: bold = False; em_italic = True
+                else:               bold = True
+            elif m == '_':
+                if not underline:   underline = True
+                elif not subscript: underline = False; subscript = True
+                else:               underline = True
+            elif m == '.':
+                if not sym:         sym = True
+                elif not idio_italic: sym = False; idio_italic = True
+                else:               sym = True
+            elif m == '-': strikethrough = True
+            elif m == '^': superscript = True
+            elif m == '%': subsup = True
+            self._pos += 1
 
-        # Collect content until )
-        content = ""
-        k = 1
-        while pos < len(text) and k:
-            if text[pos] == '(':
-                k += 1
-            elif text[pos] == ')':
-                k -= 1
-            if not k: break
-            content += text[pos]
-            pos += 1
+        fmt = IFormatOpen(
+            bold=bold, em_italic=em_italic, underline=underline,
+            strikethrough=strikethrough, subscript=subscript,
+            superscript=superscript, subsup=subsup, sym=sym,
+            idio_italic=idio_italic,
+        )
 
-        if pos >= len(text) or not content:
-            return None, start_pos
+        content = self._read_balanced(')')
 
-        pos += 1  # Consume )
-        return {
-            'type': 'formatted',
-            'content': content,
-            'bold': bold,
-            'italic': italic,
-            'underline': underline,
-            'strikethrough': strikethrough,
-            'subscript': subscript,
-            'superscript': superscript,
-            'subsup': subsup
-        }, pos
+        if sym:
+            symbol = ISymbol(content='<br>' if content == 'br' else f'&{content};')
+            return [fmt, symbol, IFormatClose()]
 
-    def _render_blocks_to_html(self, blocks: List[Dict]) -> str:
-        """Render blocks to HTML."""
-        html = []
+        return [fmt] + _InlineLexer(content).lex() + [IFormatClose()]
 
-        for block in blocks:
-            if block['type'] == 'header':
-                level = block['level']
-                text = self._escape_html(block['text'])
-                tag = f'h{level}'
-                if block['id']:
-                    html.append(f'<{tag} id="{self._escape_html(block["id"])}">{text}</{tag}>')
-                else:
-                    html.append(f'<{tag}>{text}</{tag}>')
+    def _lex_text(self):
+        buf = ''
+        while self._pos < len(self._s):
+            ch = self._s[self._pos]
+            if ch in '\\`[': break
+            if ch == '(' and self._pos + 1 < len(self._s) and self._s[self._pos + 1] in '*_-^%.': break
+            buf += ch
+            self._pos += 1
+        return IText(content=buf)
 
-            elif block['type'] == 'paragraph':
-                para_html = '<p>'
-                inline_text = ' '.join(block['lines'])
-                para_html += self._render_inline_html(inline_text)
-                para_html += '</p>'
-                html.append(para_html)
+    def _ch(self) -> Optional[str]:
+        return self._s[self._pos] if self._pos < len(self._s) else None
 
-            elif block['type'] == 'ordered_list':
-                # Sort by numeric value
-                items = sorted(block['items'], key=lambda x: x[0])
-                list_html = '<ol>'
-                for _, text in items:
-                    list_html += '<li>' + self._render_inline_html(text) + '</li>'
-                list_html += '</ol>'
-                html.append(list_html)
+    def _read_balanced(self, close: str) -> str:
+        depth = 1
+        buf = []
+        while self._pos < len(self._s) and depth > 0:
+            ch = self._s[self._pos]
+            if ch == '(':   depth += 1; buf.append(ch)
+            elif ch == close:
+                depth -= 1
+                if depth > 0: buf.append(ch)
+            else: buf.append(ch)
+            self._pos += 1
+        return ''.join(buf)
 
-            elif block['type'] == 'alphabetic_list':
-                # Preserve source order
-                list_html = '<ol>'
-                for _, text in block['items']:
-                    list_html += '<li>' + self._render_inline_html(text) + '</li>'
-                list_html += '</ol>'
-                html.append(list_html)
 
-            elif block['type'] == 'unordered_list':
-                # Render as numbered list
-                list_html = '<ol>'
-                for text in block['items']:
-                    list_html += '<li>' + self._render_inline_html(text) + '</li>'
-                list_html += '</ol>'
-                html.append(list_html)
+class JotdownLexer:
+    def __init__(self, source: str):
+        self._src = source
+        self._pos = 0
 
-            elif block['type'] == 'code_fence':
-                code = self._escape_html(block['content'])
-                lang = block.get('language', '')
-                if lang:
-                    html.append(f'<pre><code class="language-{self._escape_html(lang)}">{code}</code></pre>')
-                else:
-                    html.append(f'<pre><code>{code}</code></pre>')
-
-            elif block['type'] == 'separator_block':
-                # Parse content independently
-                inner_parser = JotdownParser(block['content'])
-                inner_html = inner_parser.parse()
-                html.append(f'<div class="separator-block">{inner_html}</div>')
-
-            elif block['type'] == 'style_block':
-                html.append(f'<style>{block["content"]}</style>')
-
-            elif block['type'] == 'html_block':
-                html.append(block['content'])
-
-        return '\n'.join(html)
-
-    def _render_inline_html(self, text: str) -> str:
-        """Render inline elements to HTML."""
-        tokens = self._parse_inline(text)
-        html = ""
-
-        for token in tokens:
-            if token['type'] == 'text':
-                html += self._escape_html(token['content'])
-
-            elif token['type'] == 'inline_code':
-                code = self._escape_html(token['content'])
-                lang = token.get('language', '')
-                if lang:
-                    html += f'<code class="language-{self._escape_html(lang)}">{code}</code>'
-                else:
-                    html += f'<code>{code}</code>'
-
-            elif token['type'] == 'link':
-                text_part = self._escape_html(token['text'])
-                url = self._escape_html(token['url'])
-                html += f'<a href="{url}">{text_part}</a>'
-
-            elif token['type'] == 'image_link':
-                src = self._escape_html(token['text'])
-                url = self._escape_html(token['url'])
-                html += f'<a href="{url}"><img src="{src}" alt="image" /></a>'
-
-            elif token['type'] == 'formatted':
-                content = JotdownParser(token["content"]).parse(False)[3:-4]
-                if token['bold']:
-                    content = f'<strong>{content}</strong>'
-                if token['underline']:
-                    content = f'<u>{content}</u>'
-                if token['strikethrough']:
-                    content = f'<s>{content}</s>'
-                if token['subscript']:
-                    content = f'<sub>{content}</sub>'
-                if token['superscript']:
-                    content = f'<sup>{content}</sup>'
-                if token['subsup']:
-                    lower, upper = content.split("::")
-                    content = f'<span style="display:inline-flex; flex-direction:column; line-height:1; vertical-align:middle;"><span style="font-size:0.75em;">{upper}</span><span style="font-size:0.75em;">{lower}</span></span>'
-                html += content
-
-        return html
+    def lex(self) -> list:
+        tokens = []
+        self._skip_blank()
+        while self._pos < len(self._src):
+            result = self._lex_block()
+            if result is None:
+                self._pos += 1
+            elif isinstance(result, list):
+                tokens.extend(result)
+            else:
+                tokens.append(result)
+            self._skip_blank()
+        return tokens
 
     @staticmethod
-    def _escape_html(text: str) -> str:
-        """Escape HTML special characters."""
-        return (text
-                .replace('&', '&amp;')
-                .replace('<', '&lt;')
-                .replace('>', '&gt;')
-                .replace('"', '&quot;')
-                .replace("'", '&#39;'))
+    def lex_inline(text: str) -> list:
+        return _InlineLexer(text).lex()
+
+    def _lex_block(self):
+        rest = self._rest()
+
+        if rest.startswith('#'):
+            return self._lex_header()
+        if rest.startswith('!['):
+            return self._lex_nested_block('separator')
+        if rest.startswith('!style['):
+            return self._lex_raw_block('style')
+        if rest.startswith('!html['):
+            return self._lex_raw_block('html')
+        if rest.startswith('..'):
+            return self._lex_uln_run()
+        if rest.startswith(',,'):
+            return self._lex_ul_run()
+        if rest.startswith('---'):
+            return self._lex_hr()
+        if re.match(r'\d+\.', rest):
+            return self._lex_ol_run()
+        return self._lex_paragraph()
+    
+    def _lex_hr(self):
+        self._pos += 3
+        self._skip_blank()
+        return [THrLine()]
+
+    def _lex_header(self):
+        level = 0
+        while self._ch() == '#': level += 1; self._pos += 1
+        while self._ch() == ' ': self._pos += 1
+
+        anchor = None
+        if self._ch() == '<':
+            self._pos += 1
+            anchor = self._read_until('>')
+            if self._ch() == '>': self._pos += 1
+            while self._ch() == ' ': self._pos += 1
+
+        return THeader(level=level, text=self._consume_line().strip(), anchor=anchor)
+
+    def _lex_ol_run(self):
+        items = []
+        while self._pos < len(self._src):
+            m = re.match(r'(\d+)\.\s*', self._rest())
+            if not m: break
+            number = int(m.group(1))
+            self._pos += len(m.group(0))
+            items.append(TOlItem(number=number, text=self._consume_line()))
+            saved = self._pos
+            self._skip_blank()
+            if not re.match(r'\d+\.', self._rest()):
+                self._pos = saved; break
+        return items
+
+    def _lex_uln_run(self):
+        items = []
+        while self._pos < len(self._src) and self._rest().startswith('..'):
+            self._pos += 2
+            while self._ch() == ' ': self._pos += 1
+            items.append(TUlItem(text=self._consume_line()))
+            saved = self._pos
+            self._skip_blank()
+            if not self._rest().startswith('..'):
+                self._pos = saved; break
+        return items
+
+    def _lex_ul_run(self):
+        items = []
+        while self._pos < len(self._src) and self._rest().startswith(',,'):
+            self._pos += 2
+            while self._ch() == ' ': self._pos += 1
+            items.append(TUlItemAny(text=self._consume_line()))
+            saved = self._pos
+            self._skip_blank()
+            if not self._rest().startswith(',,'):
+                self._pos = saved; break
+        return items
+
+    def _lex_nested_block(self, kind: str):
+        self._pos += {'separator': 2, 'style': 7, 'html': 6}[kind]
+        raw = self._read_balanced(']')
+        inner = JotdownLexer(raw).lex()
+        return [TBlockOpen(kind=kind)] + inner + [TBlockClose()]
+
+    def _lex_raw_block(self, kind: str):
+        self._pos += {'style': 7, 'html': 6}[kind]
+        return TRawContent(raw=self._read_balanced(']'), kind=kind)
+
+    def _lex_paragraph(self):
+        tokens = []
+        while self._pos < len(self._src):
+            rest = self._rest()
+            if (rest.startswith('#') or rest.startswith('![')
+                    or rest.startswith('!style[') or rest.startswith('!html[')
+                    or rest.startswith('..') or rest.startswith(',,') or re.match(r'\d+\.', rest)):
+                break
+            line = self._consume_line()
+            if not line.strip():
+                tokens.append(TParaBreak()); break
+            tokens.append(TParaLine(text=line))
+        return tokens
+
+    def _ch(self) -> Optional[str]:
+        return self._src[self._pos] if self._pos < len(self._src) else None
+
+    def _rest(self) -> str:
+        return self._src[self._pos:]
+
+    def _consume_line(self) -> str:
+        start = self._pos
+        while self._pos < len(self._src) and self._src[self._pos] != '\n':
+            self._pos += 1
+        result = self._src[start:self._pos]
+        if self._pos < len(self._src): self._pos += 1
+        return result
+
+    def _read_until(self, stop: str) -> str:
+        start = self._pos
+        while self._pos < len(self._src) and self._src[self._pos] != stop:
+            self._pos += 1
+        return self._src[start:self._pos]
+
+    def _read_balanced(self, close: str) -> str:
+        open_ch = '[' if close == ']' else '('
+        depth = 1
+        buf = []
+        while self._pos < len(self._src) and depth > 0:
+            ch = self._src[self._pos]
+            if ch == open_ch:   depth += 1; buf.append(ch)
+            elif ch == close:
+                depth -= 1
+                if depth > 0: buf.append(ch)
+            else: buf.append(ch)
+            self._pos += 1
+        return ''.join(buf)
+
+    def _skip_blank(self):
+        while self._pos < len(self._src) and self._src[self._pos] in ' \t\n\r':
+            self._pos += 1
+
+
+class JotdownHTMLCompiler:
+    def compile(self, tokens: list, *, standalone: bool = True) -> str:
+        body = '\n'.join(self._compile_blocks(tokens))
+        if standalone:
+            return '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n' + body
+        return body
+
+    def _compile_blocks(self, tokens: list) -> list:
+        out = []
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+
+            if isinstance(tok, THeader):
+                out.append(self._render_header(tok)); i += 1
+
+            elif isinstance(tok, TOlItem):
+                items = []
+                while i < len(tokens) and isinstance(tokens[i], TOlItem):
+                    items.append(tokens[i]); i += 1
+                out.append(self._render_ol(items))
+
+            elif isinstance(tok, TUlItem):
+                items = []
+                while i < len(tokens) and isinstance(tokens[i], TUlItem):
+                    items.append(tokens[i]); i += 1
+                out.append(self._render_uln(items))
+
+            elif isinstance(tok, TUlItemAny):
+                items = []
+                while i < len(tokens) and isinstance(tokens[i], TUlItemAny):
+                    items.append(tokens[i]); i += 1
+                out.append(self._render_ul(items))
+
+            elif isinstance(tok, TParaLine):
+                lines = []
+                while i < len(tokens) and isinstance(tokens[i], (TParaLine, TParaBreak)):
+                    if isinstance(tokens[i], TParaBreak): i += 1; break
+                    lines.append(tokens[i].text); i += 1
+                out.append(self._render_para(lines))
+
+            elif isinstance(tok, TBlockOpen) and tok.kind == 'separator':
+                i += 1
+                inner, depth = [], 1
+                while i < len(tokens) and depth > 0:
+                    if isinstance(tokens[i], TBlockOpen): depth += 1
+                    elif isinstance(tokens[i], TBlockClose):
+                        depth -= 1
+                        if depth == 0: i += 1; break
+                    inner.append(tokens[i]); i += 1
+                inner_html = self.compile(inner, standalone=False)
+                out.append(
+                    f'<div class="separator-block" style="font-size:0.90em;display:block;'
+                    f'width:auto;padding-left:1.5rem;">{inner_html}</div>'
+                )
+            
+            elif isinstance(tok, THrLine):
+                out.append('<hr>')
+                i += 1
+
+            elif isinstance(tok, TRawContent):
+                if tok.kind == 'style':
+                    out.append(f'<style>{tok.raw}</style>')
+                else:
+                    out.append(tok.raw)
+                i += 1
+
+            else:
+                i += 1
+
+        return out
+
+    def _render_header(self, tok: THeader) -> str:
+        tag = f'h{tok.level}'
+        content = self._render_inline(JotdownLexer.lex_inline(tok.text))
+        if tok.anchor:
+            return f'<{tag} id="{_esc(tok.anchor)}">{content}</{tag}>'
+        return f'<{tag}>{content}</{tag}>'
+
+    def _render_ol(self, items: list) -> str:
+        rows = '\n'.join(
+            f'<li>{self._render_inline(JotdownLexer.lex_inline(it.text))}</li>'
+            for it in sorted(items, key=lambda x: x.number)
+        )
+        return f'<ol>\n{rows}\n</ol>'
+        
+    def _render_uln(self, items: list) -> str:
+        rows = '\n'.join(
+            f'<li>{self._render_inline(JotdownLexer.lex_inline(it.text))}</li>'
+            for it in items
+        )
+        return f'<ol>\n{rows}\n</ol>'
+
+    def _render_ul(self, items: list) -> str:
+        rows = '\n'.join(
+            f'<li>{self._render_inline(JotdownLexer.lex_inline(it.text))}</li>'
+            for it in items
+        )
+        return f'<ul>\n{rows}\n</ul>'
+
+    def _render_para(self, lines: list) -> str:
+        return f'<p>{self._render_inline(JotdownLexer.lex_inline(" ".join(lines)))}</p>'
+
+    def _render_inline(self, tokens: list) -> str:
+        stack: list[list[str]] = []
+        out = []
+
+        for tok in tokens:
+            if isinstance(tok, IText):
+                out.append(_esc(tok.content))
+
+            elif isinstance(tok, IInlineCode):
+                code = _esc(tok.content)
+                if tok.language:
+                    out.append(f'<code class="language-{_esc(tok.language)}">{code}</code>')
+                else:
+                    out.append(f'<code>{code}</code>')
+
+            elif isinstance(tok, ILink):
+                label = self._render_inline(tok.text_tokens)
+                out.append(f'<a href="{_esc(tok.url)}">{label}</a>')
+
+            elif isinstance(tok, IImage):
+                out.append(f'<a href="{_esc(tok.url)}"><img src="{_esc(tok.src)}" alt="{_esc(tok.default)}"></a>')
+
+            elif isinstance(tok, ISymbol):
+                out.append(tok.content)
+
+            elif isinstance(tok, IFormatOpen):
+                if tok.subsup:
+                    # defer: push a marker; content will be post-processed by IFormatClose
+                    stack.append(['__subsup__'])
+                    out.append('\x00SUBSUP_OPEN\x00')
+                else:
+                    opens, closes = self._format_tags(tok)
+                    out.extend(opens)
+                    stack.append(closes)
+
+            elif isinstance(tok, IFormatClose):
+                if stack:
+                    closes = stack.pop()
+                    if closes == ['__subsup__']:
+                        # find the marker, extract content, split on ::
+                        joined = ''.join(out)
+                        marker = '\x00SUBSUP_OPEN\x00'
+                        idx = joined.rfind(marker)
+                        if idx != -1:
+                            content = joined[idx + len(marker):]
+                            before = joined[:idx]
+                            parts = content.split('::', 1)
+                            lower = parts[0] if len(parts) > 0 else ''
+                            upper = parts[1] if len(parts) > 1 else ''
+                            subsup_html = (
+                                '<span style="display:inline-flex;flex-direction:column;'
+                                'line-height:1;vertical-align:middle;">'
+                                f'<span style="font-size:0.40em;position:relative;top:-0.5em;">{upper}</span>'
+                                f'<span style="font-size:0.40em;position:relative;top:0.5em;">{lower}</span>'
+                                '</span>'
+                            )
+                            out = list(before) + [subsup_html]
+                    else:
+                        out.extend(reversed(closes))
+
+        while stack:
+            closes = stack.pop()
+            if closes != ['__subsup__']:
+                out.extend(reversed(closes))
+
+        return ''.join(out)
+
+    @staticmethod
+    def _format_tags(fmt: IFormatOpen):
+        opens, closes = [], []
+
+        def wrap(o, c):
+            opens.append(o); closes.append(c)
+
+        if fmt.bold:          wrap('<strong>', '</strong>')
+        if fmt.em_italic:     wrap('<em>', '</em>')
+        if fmt.idio_italic:   wrap('<i>', '</i>')
+        if fmt.underline:     wrap('<u>', '</u>')
+        if fmt.strikethrough: wrap('<s>', '</s>')
+        if fmt.subscript:     wrap('<sub style="font-size:0.60em;">', '</sub>')
+        if fmt.superscript:   wrap('<sup style="font-size:0.60em;">', '</sup>')
+
+        return opens, closes
+
+
+def parse(source: str, *, standalone: bool = True) -> str:
+    tokens = JotdownLexer(source).lex()
+    return JotdownHTMLCompiler().compile(tokens, standalone=standalone)
+
+
+def _esc(text: str) -> str:
+    return _html.escape(text, quote=True)
 
 
 if __name__ == '__main__':
-    example = """
-S (%10::13) 2x dx = 69 
-"""
+    example = r"""
+# Jotdown
 
-    parser = JotdownParser(example)
-    html = parser.parse()
-    open("file.html", "w").write(html)
-    print(html)
+## Numbered Lists
+### Ordered List
+1. What
+2. Eh
+### Unordered Numbered List
+.. What
+.. Eh
+## Unordered List
+,, What
+,, Eh
+
+Horizontal Line
+
+---
+
+##<what> Header with explicit ID
+
+[Links!](example.com)
+[!image-link??Default text here](example.com)
+
+Paragraph! Math symbols (.int)(%10::13) 2x (..dx) = 69
+
+"""
+    result = parse(example)
+    open("out.html", "w").write(result)
+    print(result)
