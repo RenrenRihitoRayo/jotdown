@@ -46,6 +46,10 @@ class TRawContent:
     raw: str
     kind: str  # "style" | "html"
 
+@dataclass
+class TForcedPara:
+    raw: str  # raw Jotdown inline source inside !p[...]
+
 
 @dataclass
 class IText:
@@ -103,8 +107,10 @@ class _InlineLexer:
             ch = self._ch()
             if ch == '\\':
                 self._pos += 1
-                tokens.append(IText(content=self._ch() or ''))
-                self._pos += 1
+                nxt = self._ch()
+                if nxt is not None:
+                    tokens.append(IText(content=nxt))
+                    self._pos += 1
             elif ch == '`':
                 tokens.append(self._lex_code())
             elif ch == '[':
@@ -126,10 +132,21 @@ class _InlineLexer:
             if self._ch() == '>': self._pos += 1
             if self._ch() == ' ': self._pos += 1
         code = ''
+        # Read until unescaped closing backtick
         while self._pos < len(self._s) and self._s[self._pos] != '`':
-            code += self._s[self._pos]
-            self._pos += 1
+            if self._s[self._pos] == '\\' and self._pos + 1 < len(self._s) and self._s[self._pos + 1] == '`':
+                # Escaped backtick inside code span — include a literal backtick
+                code += '`'
+                self._pos += 2
+            else:
+                code += self._s[self._pos]
+                self._pos += 1
         if self._ch() == '`': self._pos += 1
+        # Strip exactly one leading newline and one trailing newline (multiline fences)
+        if code.startswith('\n'):
+            code = code[1:]
+        if code.endswith('\n'):
+            code = code[:-1]
         return IInlineCode(content=code, language=language)
 
     def _lex_link(self):
@@ -239,6 +256,32 @@ class _InlineLexer:
         return ''.join(buf)
 
 
+def _line_starts_block(rest: str) -> bool:
+    """Return True if *rest* (text from the current position to EOL / EOF)
+    looks like the start of a Jotdown block-level construct."""
+    return (
+        rest.startswith('#')
+        or rest.startswith('![')
+        or rest.startswith('!style[')
+        or rest.startswith('!html[')
+        or rest.startswith('!p[')
+        or rest.startswith('..')
+        or rest.startswith(',,')
+        or bool(re.match(r'\d+\.', rest))
+    )
+
+
+def _skip_backtick_spans(line: str) -> str:
+    """Return the portion of *line* that lies outside any leading backtick
+    code span, so callers can test whether it starts a block-level trigger.
+    If the line begins with a backtick the whole line is (the start of) a code
+    span — return '' to suppress block-trigger detection.
+    """
+    if line.startswith('`'):
+        return ''   # starts with a code span — not a block trigger
+    return line
+
+
 class JotdownLexer:
     def __init__(self, source: str):
         self._src = source
@@ -273,6 +316,8 @@ class JotdownLexer:
             return self._lex_raw_block('style')
         if rest.startswith('!html['):
             return self._lex_raw_block('html')
+        if rest.startswith('!p['):
+            return self._lex_forced_para()
         if rest.startswith('..'):
             return self._lex_uln_run()
         if rest.startswith(',,'):
@@ -303,42 +348,106 @@ class JotdownLexer:
         return THeader(level=level, text=self._consume_line().strip(), anchor=anchor)
 
     def _lex_ol_run(self):
-        items = []
+        tokens = []
         while self._pos < len(self._src):
             m = re.match(r'(\d+)\.\s*', self._rest())
             if not m: break
             number = int(m.group(1))
             self._pos += len(m.group(0))
-            items.append(TOlItem(number=number, text=self._consume_line()))
-            saved = self._pos
-            self._skip_blank()
-            if not re.match(r'\d+\.', self._rest()):
-                self._pos = saved; break
-        return items
+            tokens.append(TOlItem(number=number, text=self._consume_line()))
+            self._skip_blank_lines()
+            # Absorb any interleaved paragraph lines that are not a new list item
+            # or a hard block-level construct (header, other list type, block, hr).
+            tokens.extend(self._lex_interleaved_para(lambda r: bool(re.match(r'\d+\.', r))))
+        return tokens
 
     def _lex_uln_run(self):
-        items = []
+        tokens = []
         while self._pos < len(self._src) and self._rest().startswith('..'):
             self._pos += 2
             while self._ch() == ' ': self._pos += 1
-            items.append(TUlItem(text=self._consume_line()))
-            saved = self._pos
-            self._skip_blank()
-            if not self._rest().startswith('..'):
-                self._pos = saved; break
-        return items
+            tokens.append(TUlItem(text=self._consume_line()))
+            self._skip_blank_lines()
+            tokens.extend(self._lex_interleaved_para(lambda r: r.startswith('..')))
+        return tokens
 
     def _lex_ul_run(self):
-        items = []
+        tokens = []
         while self._pos < len(self._src) and self._rest().startswith(',,'):
             self._pos += 2
             while self._ch() == ' ': self._pos += 1
-            items.append(TUlItemAny(text=self._consume_line()))
-            saved = self._pos
-            self._skip_blank()
-            if not self._rest().startswith(',,'):
-                self._pos = saved; break
-        return items
+            tokens.append(TUlItemAny(text=self._consume_line()))
+            self._skip_blank_lines()
+            tokens.extend(self._lex_interleaved_para(lambda r: r.startswith(',,')))
+        return tokens
+
+    def _lex_interleaved_para(self, is_same_list) -> list:
+        """Collect paragraph lines that appear between list items.
+        Returns TParaLine / TParaBreak tokens to be appended to the list token
+        stream, consuming them from source.  Stops (without consuming) as soon
+        as a hard block-level trigger OR a new item of the same list kind is
+        seen.  If the next non-blank content is a hard block trigger, returns []
+        and leaves the source position unchanged."""
+        saved = self._pos
+        tokens = []
+        inside_backtick = False
+
+        while self._pos < len(self._src):
+            rest = self._rest()
+
+            # A new item of the same list kind — stop, let the caller loop pick it up
+            if not inside_backtick and is_same_list(rest):
+                break
+
+            # A hard block trigger that is NOT a paragraph — stop and restore,
+            # UNLESS it is !p[...] which is explicitly designed to be absorbed.
+            if not inside_backtick:
+                logical = _skip_backtick_spans(rest)
+                if logical and _line_starts_block(logical):
+                    if logical.startswith('!p['):
+                        # Absorb the forced-para block directly
+                        tok = self._lex_forced_para()
+                        tokens.append(tok)
+                        saved = self._pos
+                        self._skip_blank_lines()
+                        continue
+                    # Restore to saved so the outer lex() loop handles this block
+                    self._pos = saved
+                    return []
+
+            line = self._consume_line()
+
+            if not inside_backtick and not line.strip():
+                tokens.append(TParaBreak())
+                self._skip_blank_lines()
+                # Peek: if what follows is still not a same-list item and not a
+                # hard block, keep going; otherwise stop
+                rest2 = self._rest()
+                if is_same_list(rest2):
+                    break
+                logical2 = _skip_backtick_spans(rest2)
+                if logical2 and _line_starts_block(logical2):
+                    if logical2.startswith('!p['):
+                        pass  # let the main loop absorb it next iteration
+                    else:
+                        break
+                continue
+
+            tokens.append(TParaLine(text=line))
+            saved = self._pos  # update saved past consumed content
+
+            # Track backtick span state
+            i = 0
+            while i < len(line):
+                if line[i] == '\\' and i + 1 < len(line) and line[i + 1] == '`':
+                    i += 2
+                elif line[i] == '`':
+                    inside_backtick = not inside_backtick
+                    i += 1
+                else:
+                    i += 1
+
+        return tokens
 
     def _lex_nested_block(self, kind: str):
         self._pos += {'separator': 2, 'style': 7, 'html': 6}[kind]
@@ -350,18 +459,47 @@ class JotdownLexer:
         self._pos += {'style': 7, 'html': 6}[kind]
         return TRawContent(raw=self._read_balanced(']'), kind=kind)
 
+    def _lex_forced_para(self):
+        self._pos += 3  # skip '!p['
+        return TForcedPara(raw=self._read_balanced(']'))
+
     def _lex_paragraph(self):
         tokens = []
+        # Track whether we are inside an open backtick span that started on a
+        # previous line.  When inside_backtick is True, block-level triggers
+        # on the current line must be ignored — they are literal code content.
+        inside_backtick = False
+
         while self._pos < len(self._src):
             rest = self._rest()
-            if (rest.startswith('#') or rest.startswith('![')
-                    or rest.startswith('!style[') or rest.startswith('!html[')
-                    or rest.startswith('..') or rest.startswith(',,') or re.match(r'\d+\.', rest)):
-                break
+
+            if not inside_backtick:
+                # Only break for block triggers when we are NOT inside a
+                # multi-line backtick span.
+                logical_start = _skip_backtick_spans(rest)
+                if logical_start and _line_starts_block(logical_start):
+                    break
+
             line = self._consume_line()
-            if not line.strip():
-                tokens.append(TParaBreak()); break
+
+            if not inside_backtick and not line.strip():
+                tokens.append(TParaBreak())
+                break
+
             tokens.append(TParaLine(text=line))
+
+            # Count unescaped backticks on this line to update span state.
+            # An odd count means the open/close balance flips.
+            i = 0
+            while i < len(line):
+                if line[i] == '\\' and i + 1 < len(line) and line[i + 1] == '`':
+                    i += 2  # escaped backtick — skip both chars
+                elif line[i] == '`':
+                    inside_backtick = not inside_backtick
+                    i += 1
+                else:
+                    i += 1
+
         return tokens
 
     def _ch(self) -> Optional[str]:
@@ -398,9 +536,24 @@ class JotdownLexer:
             self._pos += 1
         return ''.join(buf)
 
+    def _skip_blank_lines(self):
+        """Skip over blank (whitespace-only) lines. Used between list items so
+        that paragraphs separated by blank lines are not treated as list
+        terminators — only a non-blank, non-list line ends the run."""
+        while self._pos < len(self._src):
+            start = self._pos
+            while self._pos < len(self._src) and self._src[self._pos] == ' ':
+                self._pos += 1
+            if self._pos < len(self._src) and self._src[self._pos] == '\n':
+                self._pos += 1  # consume the blank line and keep going
+            else:
+                self._pos = start  # non-blank line — restore and stop
+                break
+
     def _skip_blank(self):
-        while self._pos < len(self._src) and self._src[self._pos] in ' \t\n\r':
-            self._pos += 1
+        #while self._pos < len(self._src) and self._src[self._pos] in ' \n\t\r':
+#            self._pos += 1
+        ...
 
 
 class JotdownHTMLCompiler:
@@ -420,22 +573,22 @@ class JotdownHTMLCompiler:
                 out.append(self._render_header(tok)); i += 1
 
             elif isinstance(tok, TOlItem):
-                items = []
-                while i < len(tokens) and isinstance(tokens[i], TOlItem):
-                    items.append(tokens[i]); i += 1
-                out.append(self._render_ol(items))
+                inner = []
+                while i < len(tokens) and isinstance(tokens[i], (TOlItem, TParaLine, TParaBreak, TForcedPara)):
+                    inner.append(tokens[i]); i += 1
+                out.append(self._render_ol(inner))
 
             elif isinstance(tok, TUlItem):
-                items = []
-                while i < len(tokens) and isinstance(tokens[i], TUlItem):
-                    items.append(tokens[i]); i += 1
-                out.append(self._render_uln(items))
+                inner = []
+                while i < len(tokens) and isinstance(tokens[i], (TUlItem, TParaLine, TParaBreak, TForcedPara)):
+                    inner.append(tokens[i]); i += 1
+                out.append(self._render_uln(inner))
 
             elif isinstance(tok, TUlItemAny):
-                items = []
-                while i < len(tokens) and isinstance(tokens[i], TUlItemAny):
-                    items.append(tokens[i]); i += 1
-                out.append(self._render_ul(items))
+                inner = []
+                while i < len(tokens) and isinstance(tokens[i], (TUlItemAny, TParaLine, TParaBreak, TForcedPara)):
+                    inner.append(tokens[i]); i += 1
+                out.append(self._render_ul(inner))
 
             elif isinstance(tok, TParaLine):
                 lines = []
@@ -470,6 +623,10 @@ class JotdownHTMLCompiler:
                     out.append(tok.raw)
                 i += 1
 
+            elif isinstance(tok, TForcedPara):
+                out.append(self._render_forced_para(tok))
+                i += 1
+
             else:
                 i += 1
 
@@ -482,29 +639,53 @@ class JotdownHTMLCompiler:
             return f'<{tag} id="{_esc(tok.anchor)}">{content}</{tag}>'
         return f'<{tag}>{content}</{tag}>'
 
-    def _render_ol(self, items: list) -> str:
-        rows = '\n'.join(
-            f'<li>{self._render_inline(JotdownLexer.lex_inline(it.text))}</li>'
-            for it in sorted(items, key=lambda x: x.number)
-        )
-        return f'<ol>\n{rows}\n</ol>'
-        
-    def _render_uln(self, items: list) -> str:
-        rows = '\n'.join(
-            f'<li>{self._render_inline(JotdownLexer.lex_inline(it.text))}</li>'
-            for it in items
-        )
-        return f'<ol>\n{rows}\n</ol>'
+    def _render_ol(self, tokens: list) -> str:
+        return f'<ol>\n{self._render_list_body(tokens, TOlItem)}\n</ol>'
 
-    def _render_ul(self, items: list) -> str:
-        rows = '\n'.join(
-            f'<li>{self._render_inline(JotdownLexer.lex_inline(it.text))}</li>'
-            for it in items
-        )
-        return f'<ul>\n{rows}\n</ul>'
+    def _render_uln(self, tokens: list) -> str:
+        return f'<ol>\n{self._render_list_body(tokens, TUlItem)}\n</ol>'
+
+    def _render_ul(self, tokens: list) -> str:
+        return f'<ul>\n{self._render_list_body(tokens, TUlItemAny)}\n</ul>'
+
+    def _render_list_body(self, tokens: list, item_type) -> str:
+        # For ol, sort item tokens by number while preserving interleaved para order.
+        if item_type is TOlItem:
+            sorted_items = iter(sorted(
+                [t for t in tokens if isinstance(t, item_type)],
+                key=lambda x: x.number
+            ))
+            tokens = [next(sorted_items) if isinstance(t, item_type) else t for t in tokens]
+
+        rows = []
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if isinstance(tok, item_type):
+                rows.append(f'<li>{self._render_inline(JotdownLexer.lex_inline(tok.text))}</li>')
+                i += 1
+            elif isinstance(tok, TParaLine):
+                # Batch consecutive TParaLines into one <p>
+                lines = []
+                while i < len(tokens) and isinstance(tokens[i], TParaLine):
+                    lines.append(tokens[i].text)
+                    i += 1
+                rows.append(self._render_para(lines))
+            elif isinstance(tok, TForcedPara):
+                rows.append(self._render_forced_para(tok))
+                i += 1
+            else:
+                i += 1  # TParaBreak and anything else: skip
+        return '\n'.join(rows)
+
+    def _render_forced_para(self, tok: TForcedPara) -> str:
+        return JotdownHTMLCompiler().compile(JotdownLexer(tok.raw).lex(), standalone=False)
 
     def _render_para(self, lines: list) -> str:
-        return f'<p>{self._render_inline(JotdownLexer.lex_inline(" ".join(lines)))}</p>'
+        # Join lines with newline so that inline code spanning multiple lines
+        # retains its internal whitespace. Plain prose lines are joined with a
+        # space further below in _render_inline for IText tokens.
+        return f'<p>{self._render_inline(JotdownLexer.lex_inline(chr(10).join(lines)))}</p>'
 
     def _render_inline(self, tokens: list) -> str:
         stack: list[list[str]] = []
@@ -512,11 +693,16 @@ class JotdownHTMLCompiler:
 
         for tok in tokens:
             if isinstance(tok, IText):
-                out.append(_esc(tok.content))
+                # Collapse newlines between prose words into spaces
+                out.append(_esc(tok.content.replace('\n', ' ')))
 
             elif isinstance(tok, IInlineCode):
                 code = _esc(tok.content)
-                if tok.language:
+                is_multiline = '\n' in tok.content
+                if is_multiline:
+                    lang_attr = f' class="language-{_esc(tok.language)}"' if tok.language else ''
+                    out.append(f'<pre><code{lang_attr}>{code}</code></pre>')
+                elif tok.language:
                     out.append(f'<code class="language-{_esc(tok.language)}">{code}</code>')
                 else:
                     out.append(f'<code>{code}</code>')
@@ -533,7 +719,6 @@ class JotdownHTMLCompiler:
 
             elif isinstance(tok, IFormatOpen):
                 if tok.subsup:
-                    # defer: push a marker; content will be post-processed by IFormatClose
                     stack.append(['__subsup__'])
                     out.append('\x00SUBSUP_OPEN\x00')
                 else:
@@ -545,7 +730,6 @@ class JotdownHTMLCompiler:
                 if stack:
                     closes = stack.pop()
                     if closes == ['__subsup__']:
-                        # find the marker, extract content, split on ::
                         joined = ''.join(out)
                         marker = '\x00SUBSUP_OPEN\x00'
                         idx = joined.rfind(marker)
@@ -604,28 +788,80 @@ if __name__ == '__main__':
     example = r"""
 # Jotdown
 
-## Numbered Lists
+## Why use it?
+
+.. Jotdown is lighter to use.
+.. Jotdown's Specs will be tightly handled.
+.. Jotdown is easy to implement.
+
+## Is this file an example of Jotdown?
+
+Yes.
+
+## Examples
+
+.. Lists
+!p[
 ### Ordered List
-1. What
-2. Eh
-### Unordered Numbered List
-.. What
-.. Eh
-## Unordered List
-,, What
-,, Eh
 
-Horizontal Line
+1. 1
+3. 3
+2. 2
 
----
+Does not preserve source order and follows
+numbering.
 
-##<what> Header with explicit ID
+### Numbered Unordered List
 
-[Links!](example.com)
-[!image-link??Default text here](example.com)
+.. 1
+.. 3
+.. 2
 
-Paragraph! Math symbols (.int)(%10::13) 2x (..dx) = 69
+Preserves source order. Uses <ol>
 
+### Unordeted List.
+
+,, 1
+,, 3
+,, 3
+
+Preserves source order, uses <ul>
+]
+.. Code Blocks
+!p[
+
+`<python>import this`
+`<c>printf("Hello, world!\n");`(.br)
+`<python>
+def fib(n):
+    ...
+`
+]
+.. Jotdown has dedicated HTML and Style blocks!
+!p[
+`<Jotdown>
+!style[
+p {
+    color: red;
+}
+]
+
+!html[<h1>Yes></h1>]
+`
+]
+
+.. Jotdown uses block based nesting!
+!p[
+`<Jotdown>
+![
+Regular nesting
+]
+
+!p[
+treat all content as a paragraph
+]
+`
+]
 """
     result = parse(example)
     open("out.html", "w").write(result)

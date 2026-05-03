@@ -1,23 +1,54 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <h1>Jotdown</h1>
-<h2>Numbered Lists</h2>
+<h2>Why use it?</h2>
+<ol>
+<li>Jotdown is lighter to use.</li>
+<li>Jotdown&#x27;s Specs will be tightly handled.</li>
+<li>Jotdown is easy to implement.</li>
+</ol>
+<h2>Is this file an example of Jotdown?</h2>
+<p>Yes.</p>
+<h2>Examples</h2>
+<ol>
+<li>Lists</li>
 <h3>Ordered List</h3>
 <ol>
-<li>What</li>
-<li>Eh</li>
+<li>1</li>
+<li>2</li>
+<li>3</li>
+<p>Does not preserve source order and follows numbering.</p>
 </ol>
-<h3>Unordered Numbered List</h3>
+<h3>Numbered Unordered List</h3>
 <ol>
-<li>What</li>
-<li>Eh</li>
+<li>1</li>
+<li>3</li>
+<li>2</li>
+<p>Preserves source order. Uses &lt;ol&gt;</p>
 </ol>
-<h2>Unordered List</h2>
+<h3>Unordeted List.</h3>
 <ul>
-<li>What</li>
-<li>Eh</li>
+<li>1</li>
+<li>3</li>
+<li>3</li>
+<p>Preserves source order, uses &lt;ul&gt;</p>
 </ul>
-<p>Horizontal Line</p>
-<hr>
-<h2 id="what">Header with explicit ID</h2>
-<p><a href="example.com">Links!</a> <a href="example.com"><img src="image-link" alt="Default text here"></a></p>
-<p>Paragraph! Math symbols &int;<span style="display:inline-flex;flex-direction:column;line-height:1;vertical-align:middle;"><span style="font-size:0.40em;position:relative;top:-0.5em;">13</span><span style="font-size:0.40em;position:relative;top:0.5em;">10</span></span> 2x <i>dx</i> = 69</p>
+<li>Code Blocks</li>
+<p><code class="language-python">import this</code> <code class="language-c">printf(&quot;Hello, world!\n&quot;);</code><br> <pre><code class="language-python">def fib(n):
+    ...</code></pre></p>
+<li>Jotdown has dedicated HTML and Style blocks!</li>
+<p><pre><code class="language-Jotdown">!style[
+p {
+    color: red;
+}
+]
+
+!html[&lt;h1&gt;Yes&gt;&lt;/h1&gt;]</code></pre></p>
+<li>Jotdown uses block based nesting!</li>
+<p><pre><code class="language-Jotdown">![
+Regular nesting
+]
+
+!p[
+treat all content as a paragraph
+]</code></pre></p>
+</ol>
