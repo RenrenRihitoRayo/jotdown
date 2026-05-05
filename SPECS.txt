@@ -1,0 +1,309 @@
+# <spec> Jotdown Specification
+
+## <overview> Overview
+
+Jotdown is a lightweight markup language that compiles to HTML.
+It uses punctuation-based sigils instead of whitespace indentation.
+Block structure is explicit. Inline formatting uses a uniform
+`(sigil content)` syntax. It is meant to be an alternative to
+Markdown.
+
+---
+
+## <blocks> Block Elements
+
+### <headers> Headers
+
+Prefix a line with one or more `#` characters followed by a space.
+The number of `#` characters sets the heading level (h1-h6).
+
+An optional anchor can be placed immediately after the `#` prefix,
+enclosed in `\<>`, before the heading text.
+
+`<Jotdown>
+# h1
+## h2
+### <my-anchor> h3 with anchor
+`
+
+---
+
+### <paragraphs> Paragraphs
+
+Consecutive non-blank lines form a paragraph.
+A blank line terminates the paragraph.
+Lines within a paragraph are joined with a space.
+
+---
+
+### <hr> Horizontal Rule
+
+Three dashes on their own line produce a `\<hr>`.
+
+`<Jotdown>
+---
+`
+
+---
+
+### <lists> Lists
+
+All list types absorb interleaved content between items.
+Plain paragraph lines and `!p[...]` blocks between items
+are rendered inside the list rather than terminating it.
+Only a hard block trigger (header, different list type,
+separator block, etc.) ends a list run.
+
+#### <ol> Ordered List - Decimal
+
+Lines beginning with a number followed by `.` and a space.
+Items are (*sorted) by their explicit number regardless of
+source order.
+
+`<Jotdown>
+1. first
+3. third
+2. second
+`
+
+#### <uln> Numbered Unordered List
+
+Lines beginning with `..` and a space.
+Source order is preserved. Renders as `\<ol>`.
+
+`<Jotdown>
+.. alpha
+.. beta
+.. gamma
+`
+
+#### <ul> Unordered List
+
+Lines beginning with `,,` and a space.
+Source order is preserved. Renders as `\<ul>`.
+
+`<Jotdown>
+,, red
+,, green
+,, blue
+`
+
+#### <roman-ol> Ordered List - Roman Numerals
+
+Lines beginning with a roman numeral followed by `.` and a space.
+Case of the numeral sets the list style.
+Items are sorted by value regardless of source order.
+
+`<Jotdown>
+I. first
+III. third
+II. second
+
+i. one
+iii. three
+ii. two
+`
+
+#### <roman-ul> Unordered List - Roman Numerals
+
+Lines beginning with `.i` or `.I` followed by a space.
+Source order is preserved.
+`.i` renders `lower-roman`, `.I` renders `upper-roman`.
+
+`<Jotdown>
+.i alpha
+.i beta
+
+.I Alpha
+.I Beta
+`
+
+#### <list-absorption> List Absorption
+
+Plain text between list items is absorbed into the list.
+`!p[...]` between items is also absorbed.
+A hard block (header, different list kind, `![...]`, etc.)
+ends the list.
+
+`<Jotdown>
+.. First item
+A paragraph absorbed into the list.
+Second line of that paragraph.
+.. Second item
+!p[ A forced-para block, also absorbed. ]
+.. Third item
+`
+
+---
+
+### <separator> Separator Block - `![...]`
+
+Content inside `![...]` is parsed as full Jotdown and rendered
+inside an indented `\<div>`. Blocks can be nested.
+
+`<Jotdown>
+![
+### Nested header
+
+.. nested list item
+.. another item
+]
+`
+
+---
+
+### <forced-para> Forced Paragraph Block - `!p[...]`
+
+Content inside `!p[...]` is parsed as full Jotdown and emitted
+bare (no wrapper element). It behaves like a paragraph to
+surrounding list items and is absorbed rather than terminating
+a list run.
+
+`<Jotdown>
+.. list item
+!p[
+Some (*bold) content parsed as Jotdown.
+]
+.. another item
+`
+
+---
+
+### <style> Style Block - `!style[...]`
+
+Raw CSS. Emitted as `\<style>...</style>`.
+
+`<Jotdown>
+!style[
+body { font-family: sans-serif; }
+]
+`
+
+---
+
+### <html> Raw HTML Block - `!html[...]`
+
+Raw HTML emitted verbatim.
+
+`<Jotdown>
+!html[<hr class="fancy">]
+`
+
+Implementations can treat this as a no-op,
+this is for security reasons.
+
+---
+
+## <inline> Inline Elements
+
+### <inline-code> Inline Code
+
+Backtick-delimited. An optional language tag `<lang>` may follow
+the opening backtick. A single backtick closes the span.
+Backticks inside a span can be escaped with `\``.
+
+Single-line renders as `\<code>`.
+Multi-line renders as `\<pre><code>`.
+
+`<Jotdown>
+\`<python> x = 1\`
+
+\`<python>
+def fib(n):
+    ...
+\`
+
+\`code with a \\\` backtick inside\`
+`
+
+Block-level syntax inside a backtick span is inert and will not
+be parsed as Jotdown.
+
+`<Jotdown>
+\`## this is not a header\`
+\`.. this is not a list\`
+`
+
+---
+
+### <formatting> Inline Formatting
+
+Formatting uses `(sigils content)` where sigils are one or more
+of the characters `* _ - ^ . %`. The opening paren must be
+immediately followed by a sigil character.
+
+!p[
+,, `(*bold)`  - `<strong>` (*example)
+,, `(**italic)` - `<em>` (**example)
+,, `(_underline)` - `<u>` (_example)
+,, `(-strikethrough)` - `<s>` (-example)
+,, `(^superscript)` - `<sup>` (^example)
+,, `(__subscript)` - `<sub>` (__example)
+,, `(%lower::upper)` - stacked sub/superscript (%lower example::upper example)
+,, `(.symbol)` - HTML entity, e.g. `(.int)` -> (.int)
+,, `(.br)` - line break `<br>`
+,, `(..idiom)` - `<i>` (idiomatic/technical italic) (..example)
+]
+
+Multiple sigils can be combined: `(*_ bold and underline)` -> (*_ bold and underline).
+
+Math expressions can easily be done without Latex.(.br)
+(.int)(%10::13) 2x (..dx)(.br)
+(.int)(%10::13) 2(x(^2)/2) (..dx)(.br)
+(..F)(x) = x(^2)(.br)
+(.int)(%10::13) 2x (..dx) = (..F)(13) - (..F)(10)(.br)
+= 13(^2) - 10(^2)(.br)
+= 169 - 100(.br)
+= 45(__16)(.br)
+
+---
+
+### <links> Links
+
+`<Jotdown>
+[link text](https://example.com)
+`
+
+---
+
+### <images> Images
+
+`<Jotdown>
+[!img alt text?? fallback](https://example.com/img.png)
+`
+
+The `??` separator splits the inner text into src-alt and a
+fallback label. Both the image and its wrapper link are rendered.
+
+---
+
+### <escape> Escape
+
+A backslash before any character emits that character literally,
+suppressing any special meaning. Inside code spans, only `\\\`` as well
+as escaping the language specifier via `\\<lang>`
+is recognised as an escape.
+
+---
+
+## <precedence> Parsing Precedence
+
+Block-level constructs are matched in this order:
+
+1. `#` - header
+2. `![` - separator block
+3. `!style[` - style block
+4. `!html[` - raw HTML block
+5. `!p[` - forced paragraph block
+6. `..` - numbered unordered list
+7. `.i` / `.I` - roman unordered list
+8. `,,` - unordered list
+9. `---` - horizontal rule
+10. `N.` - decimal ordered list
+11. `R.` - roman ordered list (where R is a valid roman numeral)
+12. paragraph (fallthrough)
+
+Backtick spans take priority over block detection:
+a line beginning with a backtick is never treated as a block trigger.
+A multiline backtick span crossing several lines suppresses block
+parsing for all interior lines until the span closes.
