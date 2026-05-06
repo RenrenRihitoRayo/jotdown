@@ -684,7 +684,7 @@ class JotdownHTMLCompiler:
     def compile(self, tokens, *, standalone=True):
         body = '\n'.join(self._compile_blocks(tokens))
         if standalone:
-            return '<!DOCTYPE html>\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n' + JotdownHTMLCompiler.styles + "\n" + body
+            return '<!DOCTYPE html>\n<html>\n<head>\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n' + JotdownHTMLCompiler.styles + "\n</head>\n<body>\n" + body + "\n</body>\n</html>"
         return body
 
     def _compile_blocks(self, tokens):
