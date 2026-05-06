@@ -808,7 +808,7 @@ class JotdownHTMLCompiler:
             parts.append('<thead>')
             for row in thead_rows:
                 cells_html = ''.join(
-                    f'<th class="table-header" style="text-align:{align_style(ci)}padding:0.5em 0.40em;border:1px solid #ccc;'
+                    f'<th class="table-header" style="text-align:{align_style(ci)};padding:0.5em 0.40em;border:1px solid #ccc;'
                     f'background:#d0d0f0;font-weight:600;">'
                     f'{self._render_inline(JotdownLexer.lex_inline(cell))}</th>'
                     for ci, cell in enumerate(row.cells)
